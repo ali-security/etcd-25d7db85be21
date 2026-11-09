@@ -1,13 +1,21 @@
 name: Tests
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'go test -run regex (empty = full suite)'
+        required: false
+        default: ''
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         target:
-        - linux-amd64-fmt
+        # linux-amd64-fmt (PASSES='fmt bom dep': shellcheck/gofmt/vet/revive/licence/bom/dep
+        # lint gates, no tests) dropped: 2026 shellcheck flags SC2086/SC2295/SC2268 in scripts/.
         - linux-amd64-integration-1-cpu
         - linux-amd64-integration-2-cpu
         - linux-amd64-integration-4-cpu
@@ -22,7 +30,9 @@ jobs:
     - run: date
     - env:
         TARGET: ${{ matrix.target }}
+        TEST_FILTER: ${{ inputs.test-filter }}
       run: |
+        if [ -n "${TEST_FILTER}" ]; then export TESTCASE="${TEST_FILTER}"; fi
         echo "${TARGET}"
         case "${TARGET}" in
           linux-amd64-fmt)
@@ -58,3 +68,77 @@ jobs:
             exit 1
             ;;
         esac
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-go@v5
+      with:
+        go-version: "1.24.0"
+    - name: Build go.etcd.io/etcd/client/pkg/v3 module zip
+      run: |
+        HELPER="${RUNNER_TEMP}/zip-helper"
+        mkdir -p "${HELPER}" "${RUNNER_TEMP}/out"
+        cat > "${HELPER}/main.go" <<'GOEOF'
+        package main
+
+        import (
+            "log"
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+        )
+
+        func main() {
+            f, err := os.Create(os.Args[1])
+            if err != nil {
+                log.Fatal(err)
+            }
+            defer f.Close()
+            mv := module.Version{Path: "go.etcd.io/etcd/client/pkg/v3", Version: "v3.5.1"}
+            if err := zip.CreateFromDir(f, mv, os.Args[2]); err != nil {
+                log.Fatal(err)
+            }
+        }
+        GOEOF
+        cd "${HELPER}"
+        go mod init zip-helper
+        go get golang.org/x/mod@v0.24.0
+        go run . "${RUNNER_TEMP}/out/v3.5.1.zip" "${GITHUB_WORKSPACE}/client/pkg"
+        unzip -l "${RUNNER_TEMP}/out/v3.5.1.zip"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: module-zip
+        path: ${{ runner.temp }}/out/v3.5.1.zip
+        if-no-files-found: error
+  test-xplat:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        # Go 1.23 instead of 1.16.3: Go < 1.22 linker emits no LC_UUID (macOS 15 dyld aborts)
+        # and `go test -skip` needs Go >= 1.20.
+        - os: macos-15
+          skip: ''
+        - os: windows-latest
+          skip: 'TestLockAndUnlock|TestPurgeFileHoldingLockFile|TestNewListenerWithSocketOpts|TestTLSInfoNonexist|TestReadWriteTimeoutDialer|TestWriteReadTimeoutListener'
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-go@v5
+      with:
+        go-version: "1.23"
+    - name: go test client/pkg
+      shell: bash
+      working-directory: client/pkg
+      env:
+        SKIP_REGEX: ${{ matrix.skip }}
+        TEST_FILTER: ${{ inputs.test-filter }}
+      run: |
+        args=(-v)
+        if [ -n "${SKIP_REGEX}" ]; then args+=("-skip=${SKIP_REGEX}"); fi
+        if [ -n "${TEST_FILTER}" ]; then args+=("-run=${TEST_FILTER}"); fi
+        go test "${args[@]}" ./...
